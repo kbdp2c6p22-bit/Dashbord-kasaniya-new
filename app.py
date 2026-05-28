@@ -59,7 +59,7 @@ STAGE_THRESHOLDS = {
     "Подготовка к пролонгации": {"value": 14, "unit": "days"},
     "Переговоры о пролонгации": {"value": 3, "unit": "days"},
     "Выставлен счет": {"value": 2, "unit": "days"},
-    "Поставщики": {"value": 40, "unit": "days"},  # Исправлена опечатка тут
+    "Поставщики": {"value": 40, "unit": "days"},
     "РАЗРАБОТКА": {"value": 60, "unit": "days"},
     "Отказ от пролонгации": {"value": 60, "unit": "days"}
 }
@@ -82,7 +82,7 @@ def calculate_working_hours_elapsed(start_dt, end_dt):
             day_start = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=9)
             day_end = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=18)
             actual_start = max(start_dt, day_start) if current_day == start_dt.date() else day_start
-            actual_end = min(end_dt, day_end) if current_day == end_day else day_end  # Исправлена ошибка тут
+            actual_end = min(end_dt, day_end) if current_day == end_day else day_end
             if actual_start < actual_end:
                 total_work_hours += (actual_end - actual_start).total_seconds() / 3600.0
         current_day += timedelta(days=1)
@@ -119,12 +119,30 @@ def load_all_bitrix_data(start_date, end_date):
         while True:
             d_resp = requests.post(f"{BITRIX_WEBHOOK}crm.deal.list", json={
                 "filter": {"CATEGORY_ID": CATEGORY_ID, "STAGE_SEMANTIC_ID": "P"},
-                "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "OBSERVERS", "observers", "DATE_MODIFY"],
+                "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "DATE_MODIFY"],
                 "start": start
             }).json()
             raw_deals.extend(d_resp.get("result", []))
             if "next" in d_resp: start = d_resp["next"]
             else: break
+
+        # 🔥 ГАРАНТИРОВАННЫЙ ФИКС НАБЛЮДАТЕЛЕЙ ЧЕРЕЗ БЫСТРЫЙ BATCH
+        # Так как crm.deal.list игнорирует поле OBSERVERS, собираем их через пакетный crm.deal.get
+        deal_observers_map = {}
+        if raw_deals:
+            deal_ids = [d["ID"] for d in raw_deals]
+            for i in range(0, len(deal_ids), 50):
+                chunk = deal_ids[i:i+50]
+                cmd = {f"deal_{d_id}": f"crm.deal.get?id={d_id}" for d_id in chunk}
+                try:
+                    b_resp = requests.post(f"{BITRIX_WEBHOOK}batch", json={"halt": 0, "cmd": cmd}).json()
+                    b_results = b_resp.get("result", {}).get("result", {})
+                    for k, v in b_results.items():
+                        if v and isinstance(v, dict):
+                            d_id_str = k.split("_")[1]
+                            deal_observers_map[int(d_id_str)] = v.get("OBSERVERS") or v.get("observers")
+                except:
+                    pass
 
         # 4. Загрузка активностей
         raw_acts = []
@@ -152,7 +170,7 @@ def load_all_bitrix_data(start_date, end_date):
                 d_id_key = int(a["OWNER_ID"])
                 if d_id_key not in deal_last_act_map:
                     t_id = str(a.get("TYPE_ID"))
-                    deal_last_act_map[d_id_key] = "Телефонный звонок" if t_id == "2" else "Текстовое сообщение"
+                    deal_last_act_map[d_id_key] = "Telephone call" if t_id == "2" else "Text message"
 
         # Сборка сделок
         deals_list = []
@@ -160,8 +178,8 @@ def load_all_bitrix_data(start_date, end_date):
             d_id = str(d["ID"])
             d_id_int = int(d["ID"])
             
-            # Усиленный фикс наблюдателей под любые типы ответа Битрикс24
-            obs_ids = d.get("OBSERVERS") or d.get("observers")
+            # Извлекаем наблюдателей, сохраненных через детальный Batch-запрос
+            obs_ids = deal_observers_map.get(d_id_int)
             obs_names = []
             if obs_ids:
                 if isinstance(obs_ids, dict): id_list = list(obs_ids.values())

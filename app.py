@@ -33,7 +33,7 @@ CATEGORIES_HIERARCHY = [
     ("Техподдержка", ["поддерж", "технич", "инструкц", "запрос", "помощ"]),
     ("Знакомство / start", ["курир", "сопровожд", "старт", "запуск", "аккаунт", "куратор", "работ", "поддержк"]),
     ("Баннеры", ["баннер", "размер", "визуал", "реклам", "требован", "формат"]),
-    ("Апдейт карточки", ["актуализ", "обновл", "апгрейд", "апдейт", "свеж", "изменен", "услов", "переход"]),
+    ("Апдейт карточки", ["актуализ", "обновл", "апгрейд", "апдейт", "веж", "изменен", "услов", "переход"]),
     ("Категории / сортировки", ["категор", "сортиров", "подборк", "позици", "видимост", "раздел", "размещени"]),
     ("Анкета / материалы", ["анкет", "заполн", "материал", "фото", "видео", "логотип", "текст", "описан", "карточк", "контент", "макет", "правк", "seo", "уникальн", "презентац", "отзыв", "кейс", "верст", "картинк", "блок", "страниц"]),
     ("Лиды / эффективность", ["лид", "трафик", "отклик", "результат", "выхлоп", "спад", "падени"]),
@@ -59,13 +59,12 @@ STAGE_THRESHOLDS = {
     "Подготовка к пролонгации": {"value": 14, "unit": "days"},
     "Переговоры о пролонгации": {"value": 3, "unit": "days"},
     "Выставлен счет": {"value": 2, "unit": "days"},
-    "Поставщики": {"value": 40, "unit": "days"},
+    "Поставщики": {"value": 40, "days": "days"},
     "РАЗРАБОТКА": {"value": 60, "unit": "days"},
     "Отказ от пролонгации": {"value": 60, "unit": "days"}
 }
 
 def parse_bx_date(date_str):
-    """Безопасное приведение к нативному datetime Python во избежание конфликтов типов в Pandas"""
     if not date_str or pd.isna(date_str):
         return datetime.now(MSK_TZ)
     dt = pd.to_datetime(date_str)
@@ -99,7 +98,7 @@ def classify_touch_final(text):
 @st.cache_data(ttl=300)
 def load_all_bitrix_data(start_date, end_date):
     try:
-        # 1. Загрузка пользователей через GET-параметры (устойчивость к сбоям)
+        # 1. Загрузка пользователей через GET-параметры
         user_map = {}
         start = 0
         while True:
@@ -114,13 +113,13 @@ def load_all_bitrix_data(start_date, end_date):
         s_resp = requests.post(f"{BITRIX_WEBHOOK}crm.status.list", json={"filter": {"ENTITY_ID": f"DEAL_STAGE_{CATEGORY_ID}"}}).json()
         stage_map = {s["STATUS_ID"]: s["NAME"] for s in s_resp.get("result", [])}
 
-        # 3. Загрузка ВСЕХ активных сделок
+        # 3. Загрузка ВСЕХ активных сделок (Расширенный select для наблюдателей)
         raw_deals = []
         start = 0
         while True:
             d_resp = requests.post(f"{BITRIX_WEBHOOK}crm.deal.list", json={
                 "filter": {"CATEGORY_ID": CATEGORY_ID, "STAGE_SEMANTIC_ID": "P"},
-                "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "OBSERVERS", "DATE_MODIFY"],
+                "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "OBSERVERS", "observers", "DATE_MODIFY"],
                 "start": start
             }).json()
             raw_deals.extend(d_resp.get("result", []))
@@ -146,28 +145,46 @@ def load_all_bitrix_data(start_date, end_date):
             if "next" in a_resp: start_act = a_resp["next"]
             else: break
 
+        # Сборка карты последних типов контактов для каждой сделки (т.к. ID DESC, первый найденный — самый свежий)
+        deal_last_act_map = {}
+        for a in raw_acts:
+            if a.get("OWNER_TYPE_ID") == "2" and a.get("OWNER_ID"):
+                d_id_key = int(a["OWNER_ID"])
+                if d_id_key not in deal_last_act_map:
+                    t_id = str(a.get("TYPE_ID"))
+                    deal_last_act_map[d_id_key] = "Телефонный звонок" if t_id == "2" else "Текстовое сообщение"
+
         # Сборка сделок
         deals_list = []
         for d in raw_deals:
             d_id = str(d["ID"])
+            d_id_int = int(d["ID"])
             
-            # Умный фикс наблюдателей (парсинг списков и словарей из Битрикс24)
-            obs_ids = d.get("OBSERVERS")
+            # Усиленный фикс наблюдателей под любые типы ответа Битрикс24
+            obs_ids = d.get("OBSERVERS") or d.get("observers")
             obs_names = []
             if obs_ids:
                 if isinstance(obs_ids, dict): id_list = list(obs_ids.values())
                 elif isinstance(obs_ids, list): id_list = obs_ids
                 else: id_list = [obs_ids]
-                obs_names = [user_map.get(str(o).strip(), f"ID {o}") for o in id_list if str(o).strip()]
+                
+                for o in id_list:
+                    if isinstance(o, dict):
+                        o_id = str(o.get('USER_ID') or o.get('ID') or '')
+                    else:
+                        o_id = str(o).strip()
+                    if o_id:
+                        obs_names.append(user_map.get(o_id, f"ID {o_id}"))
             
             deals_list.append({
-                "deal_id": int(d["ID"]),
+                "deal_id": d_id_int,
                 "deal_name": d.get("TITLE", f"Сделка №{d_id}"),
                 "stage": stage_map.get(d.get("STAGE_ID"), d.get("STAGE_ID")),
                 "responsible_name": user_map.get(str(d.get("ASSIGNED_BY_ID")), f"ID {d.get('ASSIGNED_BY_ID')}"),
                 "observer": ", ".join(obs_names) if obs_names else "—",
                 "last_outgoing_touch_at": parse_bx_date(d.get("DATE_MODIFY")),
-                "crm_link": f"https://topfranchise.bitrix24.ru/crm/deal/details/{d_id}/"
+                "crm_link": f"https://topfranchise.bitrix24.ru/crm/deal/details/{d_id}/",
+                "last_touch_type": deal_last_act_map.get(d_id_int, "—")
             })
 
         touches_list = []
@@ -238,7 +255,7 @@ m3.metric("Зафиксировано текстовых касаний", len(df
 
 
 # ==========================================
-#🧠 АНАЛИТИЧЕСКАЯ ОЦЕНКА КАЧЕСТВА РАБОТЫ
+# АНАЛИТИЧЕСКАЯ ОЦЕНКА КАЧЕСТВА РАБОТЫ
 # ==========================================
 st.markdown("---")
 st.subheader("🧠 Аналитическая оценка качества работы")
@@ -257,7 +274,7 @@ with col_risk:
 
 
 # ==========================================
-#📞 КОНТРОЛЬ КАЧЕСТВА ТЕЛЕФОННЫХ ЗВОНКОВ
+# КОНТРОЛЬ КАЧЕСТВА ТЕЛЕФОННЫХ ЗВОНКОВ
 # ==========================================
 st.subheader("📞 Контроль качества телефонных звонков")
 if not df_calls.empty:
@@ -307,6 +324,7 @@ if not df_deals.empty:
             "Текущая стадия": stage,
             "Ответственный": deal["responsible_name"],
             "Наблюдатель": deal["observer"],
+            "Тип контакта": deal["last_touch_type"],
             "Время без связи": readable_time,
             "sort_days": sort_index,
             "Последний контакт": last_touch.strftime('%d.%m.%Y %H:%M'),

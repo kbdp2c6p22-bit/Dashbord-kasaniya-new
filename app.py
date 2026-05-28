@@ -7,7 +7,7 @@ import requests
 # Настройка страницы Streamlit
 st.set_page_config(page_title="Аналитический Дашборд Контроля Воронки", layout="wide")
 
-# Часовой пояс МСК (нативно и без багов сдвига)
+# Часовой пояс МСК
 MSK_TZ = ZoneInfo('Europe/Moscow')
 
 # КРЕДЕНШИНАЛЫ
@@ -31,7 +31,7 @@ CATEGORIES_HIERARCHY = [
     ("Запуск размещения", ["размещен", "опублик", "индексац", "поисков", "выдач", "активност"]),
     ("Личный Кабинет", ["лк", "кабинет", "доступ", "логин", "пароль", "авториз", "регистрац", "вход"]),
     ("Техподдержка", ["поддерж", "технич", "инструкц", "запрос", "помощ"]),
-    ("Знакомство / старт", ["курир", "сопровожд", "старт", "запуск", "аккаунт", "куратор", "работ", "поддержк"]),
+    ("Знакомство / start", ["курир", "сопровожд", "старт", "запуск", "аккаунт", "куратор", "работ", "поддержк"]),
     ("Баннеры", ["баннер", "размер", "визуал", "реклам", "требован", "формат"]),
     ("Апдейт карточки", ["актуализ", "обновл", "апгрейд", "апдейт", "свеж", "изменен", "услов", "переход"]),
     ("Категории / сортировки", ["категор", "сортиров", "подборк", "позици", "видимост", "раздел", "размещени"]),
@@ -65,13 +65,13 @@ STAGE_THRESHOLDS = {
 }
 
 def parse_bx_date(date_str):
-    """Безопасное приведение дат из Битрикса к временной зоне МСК"""
+    """Безопасное приведение к нативному datetime Python во избежание конфликтов типов в Pandas"""
     if not date_str or pd.isna(date_str):
         return datetime.now(MSK_TZ)
     dt = pd.to_datetime(date_str)
     if dt.tz is None:
         dt = dt.tz_localize('UTC')
-    return dt.tz_convert('Europe/Moscow')
+    return dt.tz_convert('Europe/Moscow').to_pydatetime()
 
 def calculate_working_hours_elapsed(start_dt, end_dt):
     if start_dt > end_dt: return 0.0
@@ -80,8 +80,8 @@ def calculate_working_hours_elapsed(start_dt, end_dt):
     end_day = end_dt.date()
     while current_day <= end_day:
         if current_day.weekday() < 5:
-            day_start = datetime.combine(current_day, datetime.min.time()).replace(hour=9, tzinfo=MSK_TZ)
-            day_end = datetime.combine(current_day, datetime.min.time()).replace(hour=18, tzinfo=MSK_TZ)
+            day_start = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=9)
+            day_end = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=18)
             actual_start = max(start_dt, day_start) if current_day == start_dt.date() else day_start
             actual_end = min(end_dt, day_end) if current_day == end_day else day_end
             if actual_start < actual_end:
@@ -98,16 +98,14 @@ def classify_touch_final(text):
 
 @st.cache_data(ttl=300)
 def load_all_bitrix_data(start_date, end_date):
-    """Данные кэшируются в зависимости от выбранного пользователем диапазона дат"""
     try:
-        # 1. Загрузка ВСЕХ пользователей (активные + уволенные + боты)
+        # 1. Загрузка пользователей через GET-параметры (устойчивость к сбоям)
         user_map = {}
         start = 0
         while True:
-            u_resp = requests.post(f"{BITRIX_WEBHOOK}user.get", json={"start": start}).json()
+            u_resp = requests.get(f"{BITRIX_WEBHOOK}user.get", params={"start": start}).json()
             for u in u_resp.get("result", []):
                 name = f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip()
-                # Фикс пустых имен у системных учетных записей
                 user_map[str(u["ID"])] = name if name else f"ID {u['ID']}"
             if "next" in u_resp: start = u_resp["next"]
             else: break
@@ -129,7 +127,7 @@ def load_all_bitrix_data(start_date, end_date):
             if "next" in d_resp: start = d_resp["next"]
             else: break
 
-        # 4. Потоковая загрузка активностей с серверным фильтром по датам (Фикс лимита в 300 штук)
+        # 4. Загрузка активностей
         raw_acts = []
         start_act = 0
         while True:
@@ -148,12 +146,19 @@ def load_all_bitrix_data(start_date, end_date):
             if "next" in a_resp: start_act = a_resp["next"]
             else: break
 
-        # Сборка таблиц
+        # Сборка сделок
         deals_list = []
         for d in raw_deals:
             d_id = str(d["ID"])
-            obs_ids = d.get("OBSERVERS", [])
-            obs_names = [user_map.get(str(o), f"ID {o}") for o in obs_ids] if isinstance(obs_ids, list) else []
+            
+            # Умный фикс наблюдателей (парсинг списков и словарей из Битрикс24)
+            obs_ids = d.get("OBSERVERS")
+            obs_names = []
+            if obs_ids:
+                if isinstance(obs_ids, dict): id_list = list(obs_ids.values())
+                elif isinstance(obs_ids, list): id_list = obs_ids
+                else: id_list = [obs_ids]
+                obs_names = [user_map.get(str(o).strip(), f"ID {o}") for o in id_list if str(o).strip()]
             
             deals_list.append({
                 "deal_id": int(d["ID"]),
@@ -189,22 +194,19 @@ def load_all_bitrix_data(start_date, end_date):
 
 
 # ==========================================
-# ИНТЕРФЕЙС БАР (ФИЛЬТРЫ И ДАТЫ)
+# ИНТЕРФЕЙС И ФИЛЬТРЫ
 # ==========================================
 st.sidebar.title("🎛️ Панель управления")
 if st.sidebar.button("🔄 Сбросить кэш и обновить"):
     st.cache_data.clear()
     st.rerun()
 
-# Фильтр диапазона дат
 today = datetime.now(MSK_TZ).date()
 start_date = st.sidebar.date_input("Начальная дата", today - timedelta(days=14))
 end_date = st.sidebar.date_input("Конечная дата", today)
 
-# Загрузка данных с учетом выбранных дат
 df_deals, df_touches, df_calls = load_all_bitrix_data(start_date, end_date)
 
-# Динамический сбор уникальных менеджеров изо всех источников (Улучшение фильтрации)
 all_managers = set()
 if not df_deals.empty: all_managers.update(df_deals["responsible_name"].unique())
 if not df_calls.empty: all_managers.update(df_calls["responsible_name"].unique())
@@ -216,7 +218,6 @@ if all_managers:
 else:
     selected_m = "Все менеджеры"
 
-# Локальная фильтрация по выбранному сотруднику
 if selected_m != "Все менеджеры":
     if not df_deals.empty: df_deals = df_deals[df_deals["responsible_name"] == selected_m]
     if not df_calls.empty: df_calls = df_calls[df_calls["responsible_name"] == selected_m]
@@ -224,7 +225,7 @@ if selected_m != "Все менеджеры":
 
 
 # ==========================================
-# СЧЕТЧИКИ И ВЕРХНИЕ МЕТРИКИ
+# СЧЕТЧИКИ ВЕРХНЕГО УРОВНЯ
 # ==========================================
 st.title("📊 Сквозной контроль воронки сопровождения TopFranchise")
 
@@ -237,8 +238,43 @@ m3.metric("Зафиксировано текстовых касаний", len(df
 
 
 # ==========================================
-# SLA КОНТРОЛЬ И ТАБЛИЦЫ
+#🧠 АНАЛИТИЧЕСКАЯ ОЦЕНКА КАЧЕСТВА РАБОТЫ
 # ==========================================
+st.markdown("---")
+st.subheader("🧠 Аналитическая оценка качества работы")
+
+comm_cats = ["Счет / оплата", "Позитив", "Пролонгация", "Апсел", "Цена", "КП"]
+risk_cats = ["Негатив", "Отказ"]
+
+comm_count = len(df_touches[df_touches["Категория"].isin(comm_cats)]) if not df_touches.empty else 0
+risk_count = len(df_touches[df_touches["Категория"].isin(risk_cats)]) if not df_touches.empty else 0
+
+col_comm, col_risk = st.columns(2)
+with col_comm:
+    st.info(f"💰 **Коммерческие касания (Деньги/Удержание): {comm_count}** — показывают высокую вовлеченность в закрытие сделок.")
+with col_risk:
+    st.warning(f"⚠️ **Флаги риска (Негатив/Отказ): {risk_count}** — требуют личного контроля РОПа.")
+
+
+# ==========================================
+#📞 КОНТРОЛЬ КАЧЕСТВА ТЕЛЕФОННЫХ ЗВОНКОВ
+# ==========================================
+st.subheader("📞 Контроль качества телефонных звонков")
+if not df_calls.empty:
+    df_call_stats = df_calls.groupby("responsible_name").agg(
+        Всего_звонков=("call_id", "count"),
+        Успешных_звонков=("duration", lambda x: int(sum(x >= 15))),
+        Средняя_длительность_сек=("duration", lambda x: round(float(x.mean()), 1))
+    ).reset_index().rename(columns={"responsible_name": "Менеджер", "Всего_звонков": "Всего звонков", "Успешных_звонков": "Успешных (от 15 сек)", "Средняя_длительность_сек": "Ср. длительность (сек)"})
+    st.dataframe(df_call_stats, use_container_width=True, hide_index=True)
+else:
+    st.info("Нет звонков за выбранный период.")
+
+
+# ==========================================
+# SLA КОНТРОЛЬ И РЕЕСТРЫ
+# ==========================================
+st.markdown("---")
 all_processed = []
 current_time = datetime.now(MSK_TZ)
 
@@ -252,10 +288,8 @@ if not df_deals.empty:
         total_hours = delta.total_seconds() / 3600.0
         total_days = delta.total_seconds() / 86400.0
         
-        if total_hours < 24:
-            readable_time = f"{round(total_hours, 1)} раб. ч."
-        else:
-            readable_time = f"{round(total_days, 1)} дн."
+        if total_hours < 24: readable_time = f"{round(total_hours, 1)} раб. ч."
+        else: readable_time = f"{round(total_days, 1)} дн."
             
         sort_index = round(total_days, 2)
 
@@ -296,12 +330,10 @@ if all_processed:
             
     with tab_all:
         st.dataframe(df_all, column_config={"Ссылка на CRM": st.column_config.LinkColumn("Открыть карточку сделки")}, use_container_width=True, hide_index=True)
-else:
-    st.info("Нет данных по активным сделкам для анализа.")
 
 
 # ==========================================
-# ХРОНОЛОГИЯ КАСАНИЙ ВНИЗУ
+# ХРОНОЛОГИЯ КАСАНИЙ
 # ==========================================
 st.markdown("---")
 st.subheader("📑 Лента последних касаний и дел из CRM")

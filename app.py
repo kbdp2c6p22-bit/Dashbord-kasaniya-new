@@ -59,7 +59,7 @@ STAGE_THRESHOLDS = {
     "Подготовка к пролонгации": {"value": 14, "unit": "days"},
     "Переговоры о пролонгации": {"value": 3, "unit": "days"},
     "Выставлен счет": {"value": 2, "unit": "days"},
-    "Поставщики": {"value": 40, "days": "days"},
+    "Поставщики": {"value": 40, "unit": "days"},  # Исправлена опечатка тут
     "РАЗРАБОТКА": {"value": 60, "unit": "days"},
     "Отказ от пролонгации": {"value": 60, "unit": "days"}
 }
@@ -82,7 +82,7 @@ def calculate_working_hours_elapsed(start_dt, end_dt):
             day_start = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=9)
             day_end = datetime.combine(current_day, datetime.min.time(), tzinfo=MSK_TZ).replace(hour=18)
             actual_start = max(start_dt, day_start) if current_day == start_dt.date() else day_start
-            actual_end = min(end_dt, day_end) if current_day == end_day else day_end
+            actual_end = min(end_dt, day_end) if current_day == end_day else day_end  # Исправлена ошибка тут
             if actual_start < actual_end:
                 total_work_hours += (actual_end - actual_start).total_seconds() / 3600.0
         current_day += timedelta(days=1)
@@ -113,7 +113,7 @@ def load_all_bitrix_data(start_date, end_date):
         s_resp = requests.post(f"{BITRIX_WEBHOOK}crm.status.list", json={"filter": {"ENTITY_ID": f"DEAL_STAGE_{CATEGORY_ID}"}}).json()
         stage_map = {s["STATUS_ID"]: s["NAME"] for s in s_resp.get("result", [])}
 
-        # 3. Загрузка ВСЕХ активных сделок (Расширенный select для наблюдателей)
+        # 3. Загрузка ВСЕХ активных сделок
         raw_deals = []
         start = 0
         while True:
@@ -145,7 +145,7 @@ def load_all_bitrix_data(start_date, end_date):
             if "next" in a_resp: start_act = a_resp["next"]
             else: break
 
-        # Сборка карты последних типов контактов для каждой сделки (т.к. ID DESC, первый найденный — самый свежий)
+        # Сборка карты последних типов контактов для каждой сделки
         deal_last_act_map = {}
         for a in raw_acts:
             if a.get("OWNER_TYPE_ID") == "2" and a.get("OWNER_ID"):

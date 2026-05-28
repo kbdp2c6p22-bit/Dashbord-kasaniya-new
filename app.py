@@ -98,7 +98,7 @@ def classify_touch_final(text):
 @st.cache_data(ttl=300)
 def load_all_bitrix_data(start_date, end_date):
     try:
-        # 1. Загрузка пользователей через GET-параметры
+        # 1. Загрузка пользователей
         user_map = {}
         start = 0
         while True:
@@ -126,21 +126,29 @@ def load_all_bitrix_data(start_date, end_date):
             if "next" in d_resp: start = d_resp["next"]
             else: break
 
-        # 🔥 ГАРАНТИРОВАННЫЙ ФИКС НАБЛЮДАТЕЛЕЙ ЧЕРЕЗ БЫСТРЫЙ BATCH
-        # Так как crm.deal.list игнорирует поле OBSERVERS, собираем их через пакетный crm.deal.get
+        # 🔥 ЖЕЛЕЗОБЕТОННЫЙ ФИКС НАБЛЮДАТЕЛЕЙ ЧЕРЕЗ ФОРМАТ APPLICATION/X-WWW-FORM-URLENCODED
         deal_observers_map = {}
         if raw_deals:
             deal_ids = [d["ID"] for d in raw_deals]
             for i in range(0, len(deal_ids), 50):
                 chunk = deal_ids[i:i+50]
-                cmd = {f"deal_{d_id}": f"crm.deal.get?id={d_id}" for d_id in chunk}
+                
+                # Собираем payload строго в формате стандартных POST-переменных формы для корректной работы batch
+                payload = {"halt": 0}
+                for d_id in chunk:
+                    payload[f"cmd[deal_{d_id}]"] = f"crm.deal.get?id={d_id}"
+                
                 try:
-                    b_resp = requests.post(f"{BITRIX_WEBHOOK}batch", json={"halt": 0, "cmd": cmd}).json()
+                    b_resp = requests.post(f"{BITRIX_WEBHOOK}batch", data=payload).json()
                     b_results = b_resp.get("result", {}).get("result", {})
+                    
                     for k, v in b_results.items():
-                        if v and isinstance(v, dict):
+                        if v:
                             d_id_str = k.split("_")[1]
-                            deal_observers_map[int(d_id_str)] = v.get("OBSERVERS") or v.get("observers")
+                            # Извлекаем данные сделки (на случай, если структура завернута во внутренний 'result')
+                            deal_data = v.get("result") if (isinstance(v, dict) and "result" in v) else v
+                            if isinstance(deal_data, dict):
+                                deal_observers_map[int(d_id_str)] = deal_data.get("OBSERVERS") or deal_data.get("observers")
                 except:
                     pass
 
@@ -170,7 +178,7 @@ def load_all_bitrix_data(start_date, end_date):
                 d_id_key = int(a["OWNER_ID"])
                 if d_id_key not in deal_last_act_map:
                     t_id = str(a.get("TYPE_ID"))
-                    deal_last_act_map[d_id_key] = "Telephone call" if t_id == "2" else "Text message"
+                    deal_last_act_map[d_id_key] = "Телефонный звонок" if t_id == "2" else "Текстовое сообщение"
 
         # Сборка сделок
         deals_list = []

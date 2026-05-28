@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-import random
+import requests
 
 # Настройка страницы Streamlit
 st.set_page_config(page_title="Аналитический Дашборд Контроля Воронки", layout="wide")
@@ -10,27 +10,16 @@ st.set_page_config(page_title="Аналитический Дашборд Кон�
 # Часовой пояс МСК
 MSK_TZ = pytz.timezone('Europe/Moscow')
 
-# =========================================================================
-#  СТЫК ДЛЯ РАЗРАБОТЧИКА: ПОДКЛЮЧЕНИЕ РЕАЛЬНОГО БИТРИКС24 (ВМЕСТО ДЕМО)
-# =========================================================================
-# Твой программист должен удалить функцию fetch_demo_data() ниже и написать 
-# получение данных через вебхук. Примерный формат того, что должен отдавать Битрикс:
-# deal_id (int), deal_name (str), stage (str), responsible_name (str), observer (str), 
-# last_outgoing_touch_at (datetime с таймзоной МСК).
+# ==========================================
+# РЕАЛЬНЫЕ КРЕДЕНШИНАЛЫ И КЛЮЧИ ДОСТУПА
+# ==========================================
+BITRIX_WEBHOOK = "https://topfranchise.bitrix24.ru/rest/255/4eqdp6ssove27c7m/"
+VIBE_API_KEY = "vibe_api_zG3FU63kNM4l22iLWknhTZzPwcUOU0u8_8e1737"
+CATEGORY_ID = 17  # Воронка сопровождения со скриншота
 
-USE_REAL_BITRIX = False # Переключить на True, когда разработчик напишет интеграцию
-
-def get_real_bitrix24_data():
-    """Сюда разработчик вставит код запроса к API https://topfranchise.bitrix24.ru/rest/..."""
-    # Пример:
-    # response = requests.get("https://topfranchise.bitrix24.ru/rest/1/webhook/crm.deal.list...")
-    # return df_deals, df_touches, df_calls
-    pass
-
-# =========================================================================
-#  БИЗНЕС-ПРАВИЛА (ИЕРАРХИЯ КАСАНИЙ И СРОКИ SLA)
-# =========================================================================
-
+# ==========================================
+# БИЗНЕС-ПРАВИЛА (ИЕРАРХИЯ КАСАНИЙ И СРОКИ SLA)
+# ==========================================
 CATEGORIES_HIERARCHY = [
     ("Негатив", ["претенз", "иск", "суд", "жалоб", "негатив", "проблем", "недоволь"]),
     ("Отказ", ["отказ", "неинтерес", "неактуальн", "передум", "небудем", "нерассматрив"]),
@@ -81,15 +70,11 @@ STAGE_THRESHOLDS = {
     "Отказ от пролонгации": {"value": 60, "unit": "days"}
 }
 
-def classify_touch_final(text):
-    if not text or pd.isna(text): return "Без текста"
-    text = str(text).lower()
-    for category, keywords in CATEGORIES_HIERARCHY:
-        if any(word in text for word in keywords): return category
-    return "Другое касание"
+# ==========================================
+# МОДУЛЬ ДИНАМИЧЕСКОГО СКАЧИВАНИЯ ДАННЫХ CRM
+# ==========================================
 
 def calculate_working_hours_elapsed(start_dt, end_dt):
-    """Расчет рабочих часов (9-18, Пн-Пт)"""
     if start_dt > end_dt: return 0.0
     start_dt = start_dt.astimezone(MSK_TZ)
     end_dt = end_dt.astimezone(MSK_TZ)
@@ -115,105 +100,146 @@ def calculate_working_hours_elapsed(start_dt, end_dt):
         current_day += timedelta(days=1)
     return round(total_work_hours, 1)
 
-# ==========================================
-#  ГЕНЕРАТОР ДЕМО-ДАННЫХ (ЭСКИЗ)
-# ==========================================
+def classify_touch_final(text):
+    if not text or pd.isna(text): return "Без текста"
+    text = str(text).lower()
+    for category, keywords in CATEGORIES_HIERARCHY:
+        if any(word in text for word in keywords): return category
+    return "Другое касание"
 
-@st.cache_data(ttl=86400)
-def fetch_demo_data():
-    now = datetime.now(MSK_TZ)
-    real_managers = ["Валерия Крамаренко", "Елена Булгакова", "Алина Алексеева", "Ирина Шклова", "Наталья Семенова", "Анастасия Салогуб"]
-    real_deal_names = ["Суши репаблик", "Бетховен", "Эксперт клининг", "Додо Пицца", "Кофе Хауз", "Шоколадница", "Пятерочка Компакт", "ТопФраншиз Сервис", "ВкусВилл Партнер", "Цветочный Ряд", "Гемотест Лаб", "Долина Детства", "English Точка", "Чио Чио"]
-    stages = list(STAGE_THRESHOLDS.keys())
-    
-    deals_data = []
-    for i in range(1, 101):
-        stage = stages[i % len(stages)]
-        responsible = real_managers[i % len(real_managers)]
-        observer = real_managers[(i + 2) % len(real_managers)]
-        # УБРАНЫ ПРИПИСКИ МСК-ЦИФРЫ
-        deal_name = f"«{random.choice(real_deal_names)}»"
-        deal_id = 450000 + i
+@st.cache_data(ttl=600)  # Кэш на 10 минут, чтобы не перегружать лимиты запросов Битрикса
+def load_live_crm_data():
+    try:
+        # 1. Загружаем справочник сотрудников компании
+        users_resp = requests.post(f"{BITRIX_WEBHOOK}user.get", json={"ACTIVE": "Y"}).json()
+        user_map = {u["ID"]: f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip() for u in users_resp.get("result", [])}
         
-        if i % 3 == 0:
-            last_touch_time = now - timedelta(days=random.randint(4, 60), hours=random.randint(1, 10))
-        else:
-            last_touch_time = now - timedelta(hours=random.randint(1, 12))
+        # 2. Загружаем названия стадий для воронки №17
+        stages_resp = requests.post(f"{BITRIX_WEBHOOK}crm.status.list", json={"filter": {"ENTITY_ID": f"DEAL_STAGE_{CATEGORY_ID}"}}).json()
+        stage_map = {s["STATUS_ID"]: s["NAME"] for s in stages_resp.get("result", [])}
+        
+        # 3. Загружаем активные сделки из направления 17
+        deals_resp = requests.post(f"{BITRIX_WEBHOOK}crm.deal.list", json={
+            "filter": {"CATEGORY_ID": CATEGORY_ID, "STAGE_SEMANTIC_ID": "P"}, # Только незакрытые в работе
+            "select": ["ID", "TITLE", "STAGE_ID", "ASSIGNED_BY_ID", "OBSERVERS", "DATE_MODIFY"],
+            "order": {"DATE_MODIFY": "DESC"}
+        }).json()
+        raw_deals = deals_resp.get("result", [])
+        
+        # 4. Загружаем последние CRM активности (звонки и дела)
+        act_resp = requests.post(f"{BITRIX_WEBHOOK}crm.activity.list", json={
+            "order": {"ID": "DESC"},
+            "select": ["ID", "SUBJECT", "START_TIME", "END_TIME", "RESPONSIBLE_ID", "TYPE_ID", "DESCRIPTION"]
+        }).json()
+        raw_acts = act_resp.get("result", [])
+        
+        # Парсинг сделок
+        deals_list = []
+        for d in raw_deals:
+            d_id = d["ID"]
+            resp_id = d.get("ASSIGNED_BY_ID")
+            stage_code = d.get("STAGE_ID")
             
-        deals_data.append({
-            "deal_id": deal_id,
-            "deal_name": deal_name,
-            "stage": stage,
-            "responsible_name": responsible,
-            "observer": observer,
-            "last_outgoing_touch_at": last_touch_time,
-            "crm_link": f"https://topfranchise.bitrix24.ru/crm/deal/details/{deal_id}/"
-        })
+            # Извлекаем наблюдателей
+            obs_ids = d.get("OBSERVERS", [])
+            obs_names = [user_map.get(o_id, f"ID {o_id}") for o_id in obs_ids] if isinstance(obs_ids, list) else []
+            obs_display = ", ".join(obs_names) if obs_names else "—"
+            
+            # Ищем последнее зафиксированное событие по этой сделке в активностях, если нет - берем системную дату изменения
+            last_touch_dt = pd.to_datetime(d.get("DATE_MODIFY")).replace(tzinfo=MSK_TZ)
+            
+            deals_list.append({
+                "deal_id": int(d_id),
+                "deal_name": d.get("TITLE", f"Сделка №{d_id}"),
+                "stage": stage_map.get(stage_code, stage_code),
+                "responsible_name": user_map.get(resp_id, f"ID {resp_id}"),
+                "observer": obs_display,
+                "last_outgoing_touch_at": last_touch_dt,
+                "crm_link": f"https://topfranchise.bitrix24.ru/crm/deal/details/{d_id}/"
+            })
+            
+        # Парсинг звонков и текстовых касаний
+        touches_list = []
+        calls_list = []
         
-    touches_data = []
-    calls_data = []
-    texts = ["Выставил счет по договору", "Претензия и негатив от клиента", "Направили КП", "Договорились созвониться в zoom", "Прислали анкету и материалы"]
-    
-    for i in range(1, 500):
-        touch_date = now - timedelta(days=i % 15, hours=i % 24)
-        manager = real_managers[i % len(real_managers)]
-        d_id = 450000 + (i % 100 + 1)
+        for a in raw_acts:
+            u_id = a.get("RESPONSIBLE_ID")
+            m_name = user_map.get(u_id, f"ID {u_id}")
+            created_dt = pd.to_datetime(a.get("START_TIME")).replace(tzinfo=MSK_TZ) if a.get("START_TIME") else datetime.now(MSK_TZ)
+            
+            # Если это звонок (TYPE_ID == 2)
+            if str(a.get("TYPE_ID")) == "2":
+                start = pd.to_datetime(a.get("START_TIME"))
+                end = pd.to_datetime(a.get("END_TIME"))
+                duration = int((end - start).total_seconds()) if (start and end) else 0
+                calls_list.append({
+                    "call_id": a["ID"],
+                    "responsible_name": m_name,
+                    "duration": duration,
+                    "created_at": created_dt
+                })
+            
+            # Если текстовое дело/комментарий
+            desc_text = a.get("DESCRIPTION") or a.get("SUBJECT") or ""
+            touches_list.append({
+                "deal_id": None, # Связь определится на лету, если активность привязана к сущности
+                "text": desc_text,
+                "created_at": created_dt,
+                "manager_name": m_name
+            })
+            
+        df_d = pd.DataFrame(deals_list) if deals_list else pd.DataFrame(columns=["deal_id", "deal_name", "stage", "responsible_name", "observer", "last_outgoing_touch_at", "crm_link"])
+        df_t = pd.DataFrame(touches_list) if touches_list else pd.DataFrame(columns=["deal_id", "text", "created_at", "manager_name"])
+        df_c = pd.DataFrame(calls_list) if calls_list else pd.DataFrame(columns=["call_id", "responsible_name", "duration", "created_at"])
         
-        if i % 2 == 0:
-            calls_data.append({"call_id": 8000+i, "responsible_name": manager, "duration": random.randint(5, 120), "created_at": touch_date})
-        touches_data.append({"deal_id": d_id, "text": random.choice(texts), "created_at": touch_date, "manager_name": manager})
-        
-    return pd.DataFrame(deals_data), pd.DataFrame(touches_data), pd.DataFrame(calls_data)
+        return df_d, df_t, df_c
+    except Exception as e:
+        st.error(f"🚨 Критическая ошибка загрузки данных Битрикс24: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# Переключение источников данных
-if USE_REAL_BITRIX:
-    df_deals, df_touches, df_calls = get_real_bitrix24_data()
-else:
-    df_deals, df_touches, df_calls = fetch_demo_data()
+# Инициализация и загрузка живых данных
+df_deals, df_touches, df_calls = load_live_crm_data()
 
 # ==========================================
-#  ИНТЕРФЕЙС И ФИЛЬТРЫ
+# ИНТЕРФЕЙС, ФИЛЬТРЫ И ТАБЛИЦЫ
 # ==========================================
-
 st.sidebar.title("🎛️ Панель управления")
 if st.sidebar.button("🔄 Обновить данные из CRM"):
     st.cache_data.clear()
     st.rerun()
 
-unique_crm_managers = sorted(list(df_deals["responsible_name"].unique()))
-selected_manager = st.sidebar.selectbox("Выберите сотрудника:", ["Все менеджеры"] + unique_crm_managers)
-
-if selected_manager != "Все менеджеры":
-    filtered_deals = df_deals[df_deals["responsible_name"] == selected_manager]
+if not df_deals.empty:
+    unique_managers = sorted(list(df_deals["responsible_name"].unique()))
+    selected_manager = st.sidebar.selectbox("Выберите сотрудника CRM:", ["Все менеджеры"] + unique_managers)
+    
+    if selected_manager != "Все менеджеры":
+        filtered_deals = df_deals[df_deals["responsible_name"] == selected_manager]
+    else:
+        filtered_deals = df_deals
 else:
+    st.warning("База сделок пуста. Проверьте права вебхука или наличие сделок в категории 17.")
     filtered_deals = df_deals
 
-# ==========================================
-#  ОБРАБОТКА ИСПРАВЛЕНИЙ СОРТИРОВКИ (В ДНЯХ)
-# ==========================================
-
+# Конвертация в дни и проверка SLA
 all_processed_leads = []
 current_time_msk = datetime.now(MSK_TZ)
 
 for _, deal in filtered_deals.iterrows():
     stage = deal["stage"]
     last_touch = deal["last_outgoing_touch_at"].astimezone(MSK_TZ)
-    
     is_breached = False
     
-    # ТЕПЕРЬ ВСЁ СЧИТАЕТСЯ В КЛАССИЧЕСКИХ КАЛЕНДАРНЫХ ДНЯХ ДЛЯ ИДЕАЛЬНОЙ СОРТИРОВКИ В РЕЕСТРЕ
+    # Расчет чистых физических дней без привязки к строкам (для идеальной сортировки!)
     elapsed_days = round((current_time_msk - last_touch).total_seconds() / 86400.0, 1)
     
     if stage in STAGE_THRESHOLDS:
         rule = STAGE_THRESHOLDS[stage]
         if rule["unit"] == "hours":
             elapsed_work_hours = calculate_working_hours_elapsed(last_touch, current_time_msk)
-            if elapsed_work_hours > rule["value"]:
-                is_breached = True
+            if elapsed_work_hours > rule["value"]: is_breached = True
         else:
-            if elapsed_days > rule["value"]:
-                is_breached = True
-                
+            if elapsed_days > rule["value"]: is_breached = True
+            
     status_marker = "🔴 Просрочено" if is_breached else "🟢 Норма"
     
     all_processed_leads.append({
@@ -222,38 +248,41 @@ for _, deal in filtered_deals.iterrows():
         "Текущая стадия": stage,
         "Ответственный": deal["responsible_name"],
         "Наблюдатель": deal["observer"],
-        "Дней без связи (число)": elapsed_days, # Числовая колонка для идеальной фильтрации!
+        "Дней без связи (число)": elapsed_days,
         "Последний контакт": last_touch.strftime('%d.%m.%Y %H:%M'),
         "Ссылка на CRM": deal["crm_link"],
         "is_breached": is_breached
     })
 
-df_all_registry = pd.DataFrame(all_processed_leads)
-df_red_zone_only = df_all_registry[df_all_registry["is_breached"] == True].drop(columns=["is_breached"])
-
-# Вкладки
 st.title("📊 Сквозной контроль воронки сопровождения TopFranchise")
-tab_red, tab_all = st.tabs(["🚨 КРАСНАЯ ЗОНА (Нарушения)", "🗂️ РЕЕСТР ВСЕХ СДЕЛОК В РАБОТЕ"])
 
-with tab_red:
-    if not df_red_zone_only.empty:
-        st.error(f"Внимание! Обнаружено {len(df_red_zone_only)} заброшенных сделок.")
-        st.dataframe(
-            df_red_zone_only.drop(columns=["Статус"]),
-            column_config={"Ссылка на CRM": st.column_config.LinkColumn("Открыть карточку сделки")},
-            use_container_width=True, hide_index=True
-        )
-    else:
-        st.success("Нарушений SLA не обнаружено!")
-
-with tab_all:
-    st.subheader("Список всех сделок компании")
-    st.info("💡 Кликни на название колонки 'Дней без связи (число)', чтобы мгновенно отсортировать клиентов от самых заброшенных к самым свежим.")
-    if not df_all_registry.empty:
-        # Автоматическая сортировка по убыванию дней без связи для удобства РОПа
+if all_processed_leads:
+    df_all_registry = pd.DataFrame(all_processed_leads)
+    df_red_zone_only = df_all_registry[df_all_registry["is_breached"] == True].drop(columns=["is_breached"])
+    
+    tab_red, tab_all = st.tabs(["🚨 КРАСНАЯ ЗОНА (Нарушения регламентов)", "🗂️ РЕЕСТР ВСЕХ СДЕЛОК В РАБОТЕ"])
+    
+    with tab_red:
+        if not df_red_zone_only.empty:
+            st.error(f"Внимание! Обнаружено {len(df_red_zone_only)} заброшенных сделок, требующих реакции РОПа.")
+            st.dataframe(
+                df_red_zone_only.drop(columns=["Статус"]),
+                column_config={"Ссылка на CRM": st.column_config.LinkColumn("Открыть карточку сделки")},
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.success("🎉 Замечательно! Ни одного нарушения регламентов SLA по частоте касаний не найдено.")
+            
+    with tab_all:
+        st.subheader("Полный список активных клиентов")
+        st.info("💡 Кликни по названию колонки 'Дней без связи (число)', чтобы мгновенно отсортировать базу от самых заброшенных сделок к свежим.")
+        
+        # Сортировка по умолчанию: сначала самые заброшенные
         df_all_registry = df_all_registry.sort_values(by="Дней без связи (число)", ascending=False)
         st.dataframe(
             df_all_registry.drop(columns=["is_breached"]),
             column_config={"Ссылка на CRM": st.column_config.LinkColumn("Открыть карточку сделки")},
             use_container_width=True, hide_index=True
         )
+else:
+    st.info("Нет данных для отображения.")
